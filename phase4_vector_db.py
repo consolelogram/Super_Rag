@@ -3,143 +3,101 @@ import json
 import numpy as np
 import networkx as nx
 from sentence_transformers import SentenceTransformer
-import torch
 
-# =========================================================
+# =========================
 # CONFIG
-# =========================================================
-GRAPH_PATH = os.path.join("processed_data", "knowledge_graph.gml")
-META_DIR = os.path.join("processed_data", "metadata")
-OUT_DIR = os.path.join("processed_data", "vectors")
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MODEL_NAME = "BAAI/bge-m3"
-BATCH_SIZE = 64   # 4090 can handle this easily
+KG_PATH = os.path.join(BASE_DIR, "processed_data", "knowledge_graph.gml")
+OUT_DIR = os.path.join(BASE_DIR, "processed_data", "embeddings")
+
+TEXT_MODEL = "BAAI/bge-m3"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# =========================================================
-# LOAD MODEL (GPU)
-# =========================================================
-print("[INFO] Loading BGE-M3 on GPU...")
-embedder = SentenceTransformer(
-    MODEL_NAME,
-    device="cuda"
-)
-embedder.max_seq_length = 2048
-print("[OK] Model loaded")
+# =========================
+def build_text_embeddings():
+    print("[INFO] Loading Knowledge Graph...")
+    G = nx.read_gml(KG_PATH)
 
-# =========================================================
-# HELPERS
-# =========================================================
-def load_stt_text(clip_name):
-    path = os.path.join(META_DIR, f"{clip_name}_stt.json")
-    if not os.path.exists(path):
-        return ""
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("transcript", "")
+    events = [
+        (node, attrs)
+        for node, attrs in G.nodes(data=True)
+        if attrs.get("type") == "event"
+    ]
 
-def load_vlm_text(clip_name):
-    path = os.path.join(META_DIR, f"{clip_name}_vlm.json")
-    if not os.path.exists(path):
-        return ""
+    if not events:
+        raise RuntimeError("No event nodes found in KG")
 
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    print(f"[INFO] Found {len(events)} events")
 
-    actions = " ".join(data.get("actions", []))
-    phases = data.get("temporal_phases", {})
-    temporal = " ".join(phases.values())
+    texts = []
+    event_ids = []
 
-    return f"{actions}. {temporal}".strip()
+    for event_id, attrs in events:
+        parts = []
 
-# =========================================================
-# MAIN
-# =========================================================
-def build_embeddings():
-    G = nx.read_gml(GRAPH_PATH)
+        if "caption" in attrs and attrs["caption"]:
+            parts.append(attrs["caption"])
 
-    event_visual_texts = []
-    event_audio_texts = []
-    entity_texts = []
+        if "transcript" in attrs and attrs["transcript"]:
+            parts.append(attrs["transcript"])
 
-    event_visual_nodes = []
-    event_audio_nodes = []
-    entity_nodes = []
+        for event_id, attrs in events:
+            parts = []
 
-    # ---------------- EVENTS ----------------
-    for node, attrs in G.nodes(data=True):
-        if attrs.get("type") != "event":
-            continue
+            # 1. Caption from VLM
+            if attrs.get("caption"):
+                parts.append(attrs["caption"])
 
-        clip = attrs["clip"]
+            # 2. Transcript from ASR
+            if attrs.get("transcript"):
+                parts.append(attrs["transcript"])
 
-        visual_text = load_vlm_text(clip)
-        audio_text = load_stt_text(clip)
+            # 3. Fallback: derive text from KG relations
+            if not parts:
+                neighbors = list(G.neighbors(event_id))
+                entity_texts = []
 
-        if visual_text:
-            event_visual_texts.append(visual_text)
-            event_visual_nodes.append(node)
+                for n in neighbors:
+                    n_attrs = G.nodes[n]
+                    if n_attrs.get("type") == "entity":
+                        label = n_attrs.get("label") or n
+                        entity_texts.append(label)
 
-        if audio_text:
-            event_audio_texts.append(audio_text)
-            event_audio_nodes.append(node)
+                if entity_texts:
+                    parts.append("Entities involved: " + ", ".join(entity_texts))
 
-    # ---------------- ENTITIES ----------------
-    for node, attrs in G.nodes(data=True):
-        if attrs.get("type") != "entity":
-            continue
+            # Final check
+            if not parts:
+                continue
 
-        name = attrs.get("name", "")
-        if name:
-            entity_texts.append(name)
-            entity_nodes.append(node)
+    combined = " ".join(parts).strip()
+    texts.append(combined)
+    event_ids.append(event_id)
 
-    print(f"[INFO] Embedding {len(event_visual_texts)} event-visual texts")
-    print(f"[INFO] Embedding {len(event_audio_texts)} event-audio texts")
-    print(f"[INFO] Embedding {len(entity_texts)} entities")
+    print(f"[INFO] Embedding {len(texts)} event texts")
 
-    # ---------------- EMBEDDING (GPU) ----------------
-    event_visual_vecs = embedder.encode(
-        event_visual_texts,
-        batch_size=BATCH_SIZE,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+    embedder = SentenceTransformer(TEXT_MODEL)
+    embeddings = embedder.encode(
+        texts,
+        normalize_embeddings=True,
+        show_progress_bar=True
     )
 
-    event_audio_vecs = embedder.encode(
-        event_audio_texts,
-        batch_size=BATCH_SIZE,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+    np.save(
+        os.path.join(OUT_DIR, "event_text_embeddings.npy"),
+        embeddings
     )
 
-    entity_vecs = embedder.encode(
-        entity_texts,
-        batch_size=BATCH_SIZE,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
+    with open(os.path.join(OUT_DIR, "event_text_index.json"), "w") as f:
+        json.dump(event_ids, f, indent=2)
 
-    # ---------------- SAVE ----------------
-    np.save(os.path.join(OUT_DIR, "event_visual.npy"), event_visual_vecs)
-    np.save(os.path.join(OUT_DIR, "event_audio.npy"), event_audio_vecs)
-    np.save(os.path.join(OUT_DIR, "entity.npy"), entity_vecs)
+    print("[OK] Text embeddings saved")
+    print("[DONE] Phase 4 (text) complete")
 
-    index = {
-        "event_visual": event_visual_nodes,
-        "event_audio": event_audio_nodes,
-        "entity": entity_nodes
-    }
 
-    with open(os.path.join(OUT_DIR, "index.json"), "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2)
-
-    print("[OK] Phase 4 embeddings saved")
-
-# =========================================================
-# ENTRY
-# =========================================================
+# =========================
 if __name__ == "__main__":
-    torch.cuda.empty_cache()
-    build_embeddings()
+    build_text_embeddings()
