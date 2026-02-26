@@ -1,91 +1,145 @@
 import os
 import json
-import chromadb
-from chromadb.utils import embedding_functions
+import numpy as np
+import networkx as nx
+from sentence_transformers import SentenceTransformer
+import torch
 
-def build_vector_db():
-    """Fuses multi-modal metadata and embeds it into a local vector database."""
-    meta_dir = os.path.join("processed_data", "metadata")
-    db_dir = os.path.join("processed_data", "chroma_db")
-    
-    # Initialize persistent ChromaDB client
-    client = chromadb.PersistentClient(path=db_dir)
-    
-    # Use default sentence-transformer model (downloads automatically, runs locally)
-    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    
-    # Create or grab the collection
-    collection = client.get_or_create_collection(
-        name="video_clips",
-        embedding_function=sentence_transformer_ef
+# =========================================================
+# CONFIG
+# =========================================================
+GRAPH_PATH = os.path.join("processed_data", "knowledge_graph.gml")
+META_DIR = os.path.join("processed_data", "metadata")
+OUT_DIR = os.path.join("processed_data", "vectors")
+
+MODEL_NAME = "BAAI/bge-m3"
+BATCH_SIZE = 64   # 4090 can handle this easily
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# =========================================================
+# LOAD MODEL (GPU)
+# =========================================================
+print("[INFO] Loading BGE-M3 on GPU...")
+embedder = SentenceTransformer(
+    MODEL_NAME,
+    device="cuda"
+)
+embedder.max_seq_length = 2048
+print("[OK] Model loaded")
+
+# =========================================================
+# HELPERS
+# =========================================================
+def load_stt_text(clip_name):
+    path = os.path.join(META_DIR, f"{clip_name}_stt.json")
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("transcript", "")
+
+def load_vlm_text(clip_name):
+    path = os.path.join(META_DIR, f"{clip_name}_vlm.json")
+    if not os.path.exists(path):
+        return ""
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    actions = " ".join(data.get("actions", []))
+    phases = data.get("temporal_phases", {})
+    temporal = " ".join(phases.values())
+
+    return f"{actions}. {temporal}".strip()
+
+# =========================================================
+# MAIN
+# =========================================================
+def build_embeddings():
+    G = nx.read_gml(GRAPH_PATH)
+
+    event_visual_texts = []
+    event_audio_texts = []
+    entity_texts = []
+
+    event_visual_nodes = []
+    event_audio_nodes = []
+    entity_nodes = []
+
+    # ---------------- EVENTS ----------------
+    for node, attrs in G.nodes(data=True):
+        if attrs.get("type") != "event":
+            continue
+
+        clip = attrs["clip"]
+
+        visual_text = load_vlm_text(clip)
+        audio_text = load_stt_text(clip)
+
+        if visual_text:
+            event_visual_texts.append(visual_text)
+            event_visual_nodes.append(node)
+
+        if audio_text:
+            event_audio_texts.append(audio_text)
+            event_audio_nodes.append(node)
+
+    # ---------------- ENTITIES ----------------
+    for node, attrs in G.nodes(data=True):
+        if attrs.get("type") != "entity":
+            continue
+
+        name = attrs.get("name", "")
+        if name:
+            entity_texts.append(name)
+            entity_nodes.append(node)
+
+    print(f"[INFO] Embedding {len(event_visual_texts)} event-visual texts")
+    print(f"[INFO] Embedding {len(event_audio_texts)} event-audio texts")
+    print(f"[INFO] Embedding {len(entity_texts)} entities")
+
+    # ---------------- EMBEDDING (GPU) ----------------
+    event_visual_vecs = embedder.encode(
+        event_visual_texts,
+        batch_size=BATCH_SIZE,
+        convert_to_numpy=True,
+        normalize_embeddings=True
     )
-    
-    # Gather all unique clip base names
-    files = os.listdir(meta_dir)
-    base_names = set([f.replace("_stt.json", "").replace("_vlm.json", "") for f in files if f.endswith(".json")])
-    
-    documents = []
-    metadatas = []
-    ids = []
-    
-    print(f"Found {len(base_names)} clips to embed. Fusing and indexing...")
-    
-    for base_name in base_names:
-        stt_path = os.path.join(meta_dir, f"{base_name}_stt.json")
-        vlm_path = os.path.join(meta_dir, f"{base_name}_vlm.json")
-        
-        transcript = "No dialogue."
-        caption = "No visual description."
-        
-        if os.path.exists(stt_path):
-            with open(stt_path, "r") as f:
-                transcript = json.load(f).get("transcript", transcript)
-                
-        if os.path.exists(vlm_path):
-            with open(vlm_path, "r") as f:
-                caption = json.load(f).get("caption", caption)
-                
-        # The Fusion: Combine audio and visual context into one dense document
-        fused_text = f"Visuals: {caption} | Audio: {transcript}"
-        
-        documents.append(fused_text)
-        metadatas.append({"clip_name": f"{base_name}.mp4", "type": "fused_multimodal"})
-        ids.append(base_name)
-        
-    if documents:
-        # Upsert handles both insert and update
-        collection.upsert(
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids
-        )
-        print(f"Successfully embedded {len(documents)} clips into ChromaDB!")
-    else:
-        print("No metadata found to embed.")
 
-def test_search(query_text, n_results=2):
-    """A quick test function to prove the database is searchable."""
-    db_dir = os.path.join("processed_data", "chroma_db")
-    client = chromadb.PersistentClient(path=db_dir)
-    sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    collection = client.get_collection(name="video_clips", embedding_function=sentence_transformer_ef)
-    
-    print(f"\n--- Testing Search ---")
-    print(f"Query: '{query_text}'")
-    
-    results = collection.query(
-        query_texts=[query_text],
-        n_results=n_results
+    event_audio_vecs = embedder.encode(
+        event_audio_texts,
+        batch_size=BATCH_SIZE,
+        convert_to_numpy=True,
+        normalize_embeddings=True
     )
-    
-    for i in range(len(results['ids'][0])):
-        clip_id = results['ids'][0][i]
-        distance = results['distances'][0][i]
-        text = results['documents'][0][i]
-        print(f"\nMatch {i+1}: {clip_id} (Distance/Score: {distance:.4f})")
-        print(f"Context: {text}")
 
+    entity_vecs = embedder.encode(
+        entity_texts,
+        batch_size=BATCH_SIZE,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    # ---------------- SAVE ----------------
+    np.save(os.path.join(OUT_DIR, "event_visual.npy"), event_visual_vecs)
+    np.save(os.path.join(OUT_DIR, "event_audio.npy"), event_audio_vecs)
+    np.save(os.path.join(OUT_DIR, "entity.npy"), entity_vecs)
+
+    index = {
+        "event_visual": event_visual_nodes,
+        "event_audio": event_audio_nodes,
+        "entity": entity_nodes
+    }
+
+    with open(os.path.join(OUT_DIR, "index.json"), "w", encoding="utf-8") as f:
+        json.dump(index, f, indent=2)
+
+    print("[OK] Phase 4 embeddings saved")
+
+# =========================================================
+# ENTRY
+# =========================================================
 if __name__ == "__main__":
-    build_vector_db()
-    # Edit this string to test searching for something specific that actually happens in your video
-    test_search("Describe an event or object you know is in the video")
+    torch.cuda.empty_cache()
+    build_embeddings()
