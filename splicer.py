@@ -1,49 +1,49 @@
 import os
 import math
-from moviepy.editor import VideoFileClip
-from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+import subprocess
 
-def setup_directories():
-    """Creates the strict folder architecture required for the pipeline."""
-    dirs = [
-        "raw_video",
-        "processed_data/clips",
-        "processed_data/metadata"
+CLIPS_DIR = os.path.join("processed_data", "clips")
+os.makedirs(CLIPS_DIR, exist_ok=True)
+
+def segment_video(video_path, chunk_length=10):
+    # Get duration
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
     ]
-    for d in dirs:
-        os.makedirs(d, exist_ok=True)
-        
-def segment_video(video_filename, chunk_length=10):
-    """Slices a video into fixed-length chunks without re-encoding."""
-    raw_path = os.path.join("raw_video", video_filename)
-    
-    if not os.path.exists(raw_path):
-        print(f"Error: Drop your video in the 'raw_video' folder as '{video_filename}'.")
-        return
+    duration = float(subprocess.check_output(cmd).decode().strip())
+    print(f"Total video duration: {duration:.2f} seconds")
 
-    # Get total duration
-    with VideoFileClip(raw_path) as video:
-        duration = video.duration
+    num_chunks = math.ceil(duration / chunk_length)
 
-    total_clips = math.ceil(duration / chunk_length)
-    print(f"Total video duration: {duration:.2f} seconds. Segmenting into {total_clips} clips...")
+    for i in range(num_chunks):
+        start = i * chunk_length
+        length = min(chunk_length, duration - start)
 
-    # Slice and export
-    for i in range(total_clips):
-        start_time = i * chunk_length
-        end_time = min((i + 1) * chunk_length, duration)
-        
-        # Strict naming convention (clip_0000_0010.mp4) for vector/graph mapping later
-        start_str = f"{int(start_time):04d}"
-        end_str = f"{int(end_time):04d}"
-        output_filename = f"clip_{start_str}_{end_str}.mp4"
-        output_path = os.path.join("processed_data", "clips", output_filename)
-        
-        # Stream copy extraction
-        ffmpeg_extract_subclip(raw_path, start_time, end_time, targetname=output_path)
-        print(f"Created: {output_filename}")
+        out = os.path.join(
+            CLIPS_DIR,
+            f"clip_{start:04.0f}_{start+length:04.0f}.mp4"
+        )
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss", str(start),
+            "-i", video_path,
+            "-t", str(length),
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-c:a", "aac",
+            out
+        ]
+
+        subprocess.run(cmd, check=True)
+        print(f"Saved {out}")
 
 if __name__ == "__main__":
-    setup_directories()
-    # Drop a test video named 'test.mp4' in raw_video/ before running
-    segment_video("test.mp4", chunk_length=10)
+    segment_video("D:\\ramratanhacksrm\\ramr\\raw_video\\test.mp4", chunk_length=10)
