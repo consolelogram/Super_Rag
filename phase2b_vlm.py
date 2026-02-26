@@ -4,96 +4,154 @@ import cv2
 import base64
 import ollama
 
-def extract_frames(video_path, num_frames=3):
-    """Extracts evenly spaced frames from a video clip."""
+# =========================================================
+# CONFIG
+# =========================================================
+NUM_FRAMES = 5   # adjust freely
+
+CLIPS_DIR = os.path.join("processed_data", "clips")
+META_DIR = os.path.join("processed_data", "metadata")
+
+# =========================================================
+# FRAME EXTRACTION (ROBUST)
+# =========================================================
+def extract_frames(video_path, num_frames=NUM_FRAMES):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames_b64 = []
-    
-    if total_frames == 0:
+
+    if total_frames <= 0 or num_frames <= 0:
+        cap.release()
         return frames_b64
 
-    # Calculate intervals for start, middle, and end frames
-    intervals = [int(total_frames * 0.1), int(total_frames * 0.5), int(total_frames * 0.9)]
-    
-    for frame_idx in intervals:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    indices = [
+        int((i + 1) * total_frames / (num_frames + 1))
+        for i in range(num_frames)
+    ]
+
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
-        if ret:
-            # Convert frame to jpg, then to base64 for Ollama
-            _, buffer = cv2.imencode('.jpg', frame)
-            b64_str = base64.b64encode(buffer).decode('utf-8')
-            frames_b64.append(b64_str)
-            
+        if not ret:
+            continue
+
+        h, w, _ = frame.shape
+        # Critical guard: prevents GGML tensor crashes
+        if h < 64 or w < 64:
+            continue
+
+        _, buffer = cv2.imencode(".jpg", frame)
+        frames_b64.append(base64.b64encode(buffer).decode("utf-8"))
+
     cap.release()
     return frames_b64
 
-def generate_visual_captions():
-    """Feeds frames and audio transcripts to the VLM to generate scene descriptions."""
-    clips_dir = os.path.join("processed_data", "clips")
-    meta_dir = os.path.join("processed_data", "metadata")
-    
-    clips = sorted([f for f in os.listdir(clips_dir) if f.endswith(".mp4")])
-    
+# =========================================================
+# JSON EXTRACTION (FIXED)
+# =========================================================
+def extract_json(text: str):
+    text = text.strip()
+
+    # Remove markdown fences if present
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lstrip().startswith("json"):
+            text = text.lstrip()[4:].strip()
+
+    start = text.find("{")
+    end = text.rfind("}") + 1
+
+    if start == -1 or end == -1:
+        raise ValueError("No JSON found")
+
+    return json.loads(text[start:end])
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+def run_phase2b():
+    clips = sorted(f for f in os.listdir(CLIPS_DIR) if f.endswith(".mp4"))
+
     for filename in clips:
-        base_name = filename.replace(".mp4", "")
-        vlm_path = os.path.join(meta_dir, f"{base_name}_vlm.json")
-        stt_path = os.path.join(meta_dir, f"{base_name}_stt.json")
-        
+        base = filename.replace(".mp4", "")
+        stt_path = os.path.join(META_DIR, f"{base}_stt.json")
+        vlm_path = os.path.join(META_DIR, f"{base}_vlm.json")
+
         if os.path.exists(vlm_path):
-            print(f"Skipping {filename} (already captioned).")
-            continue
-            
-        print(f"Analyzing visuals for {filename}...")
-        
-        # 1. Grab the transcript from Phase 2a
-        transcript = "No dialogue."
-        if os.path.exists(stt_path):
-            with open(stt_path, "r") as f:
-                stt_data = json.load(f)
-                transcript = stt_data.get("transcript", "No dialogue.")
-                
-        # 2. Extract visual frames
-        clip_path = os.path.join(clips_dir, filename)
-        images_b64 = extract_frames(clip_path)
-        
-        if not images_b64:
-            print(f"Failed to extract frames for {filename}.")
+            print(f"[SKIP] {filename} already processed")
             continue
 
-        # 3. Multi-modal Prompt Fusion
+        if not os.path.exists(stt_path):
+            print(f"[SKIP] Missing STT for {filename}")
+            continue
+
+        print(f"[VLM] Processing {filename}")
+
+        # ---------------- Load transcript ----------------
+        with open(stt_path, "r", encoding="utf-8") as f:
+            stt_data = json.load(f)
+            transcript = stt_data.get("transcript", "No dialogue.")
+
+        # ---------------- Frames ----------------
+        clip_path = os.path.join(CLIPS_DIR, filename)
+        images_b64 = extract_frames(clip_path)
+
+        if not images_b64:
+            print(f"[WARN] No valid frames for {filename}")
+            continue
+
+        # ---------------- Prompt ----------------
         prompt = (
-            f"You are analyzing a 10-second video clip. "
-            f"Here is the spoken dialogue during this clip: '{transcript}'. "
-            f"Based on this audio context and the provided sequential frames, "
-            f"write a brief, factual description of the scene, identifying key objects, people, and actions."
+            "You are analyzing a 10-second video clip using sequential frames.\n\n"
+            f"Dialogue (context only): \"{transcript}\"\n\n"
+            "You MUST return a JSON object with ALL fields filled.\n\n"
+            "Rules:\n"
+            "- Entities must be concrete, visible nouns (people, objects, locations).\n"
+            "- Do NOT leave the entities list empty.\n"
+            "- If unsure, list the most likely visible entity.\n\n"
+            "Return STRICT JSON only:\n"
+            "{\n"
+            "  \"entities\": [\"person\", \"object\", \"location\"],\n"
+            "  \"actions\": [\"...\"],\n"
+            "  \"temporal_phases\": {\n"
+            "    \"start\": \"...\",\n"
+            "    \"middle\": \"...\",\n"
+            "    \"end\": \"...\"\n"
+            "  }\n"
+            "}"
         )
 
+        # ---------------- Model call ----------------
         try:
             response = ollama.chat(
-                model='llava',
+                model="qwen2.5vl:7b",
                 messages=[{
-                    'role': 'user',
-                    'content': prompt,
-                    'images': images_b64
+                    "role": "user",
+                    "content": prompt,
+                    "images": images_b64
                 }]
             )
-            caption = response['message']['content'].strip()
-            
-            # 4. Save the combined knowledge
-            metadata_payload = {
-                "clip_filename": filename,
-                "caption": caption
-            }
-            
-            with open(vlm_path, "w") as f:
-                json.dump(metadata_payload, f, indent=4)
-                
-            print(f"Saved -> {vlm_path}")
-            
-        except Exception as e:
-            print(f"Error processing {filename} with Ollama: {e}")
 
+            raw = response["message"]["content"].strip()
+
+            try:
+                parsed = extract_json(raw)
+            except Exception:
+                parsed = {
+                    "error": "JSON_PARSE_FAILED",
+                    "raw_output": raw
+                }
+
+            with open(vlm_path, "w", encoding="utf-8") as f:
+                json.dump(parsed, f, indent=2)
+
+            print(f"[OK] Saved {vlm_path}")
+
+        except Exception as e:
+            print(f"[ERROR] {filename}: {e}")
+
+# =========================================================
+# ENTRY
+# =========================================================
 if __name__ == "__main__":
-    # Ensure Ollama is running in the background before executing!
-    generate_visual_captions()
+    run_phase2b()
