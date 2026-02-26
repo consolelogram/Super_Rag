@@ -1,51 +1,84 @@
 import os
 import json
+import av
 from faster_whisper import WhisperModel
 
+CLIPS_DIR = os.path.join("processed_data", "clips")
+META_DIR = os.path.join("processed_data", "metadata")
+
+MODEL_SIZE = "large-v3"
+DEVICE = "cuda"
+COMPUTE_TYPE = "float16"
+
+
+def has_audio_stream(video_path: str) -> bool:
+    """
+    Returns True if the video file has at least one audio stream.
+    """
+    try:
+        container = av.open(video_path)
+        audio_streams = [s for s in container.streams if s.type == "audio"]
+        container.close()
+        return len(audio_streams) > 0
+    except Exception:
+        return False
+
+
 def transcribe_clips():
-    """Iterates through video clips, transcribes audio, and saves metadata."""
-    clips_dir = os.path.join("processed_data", "clips")
-    meta_dir = os.path.join("processed_data", "metadata")
-    
-    # Initialize the model. Change device to "cuda" if you have an Nvidia GPU setup.
-    print("Loading Faster-Whisper model (small)...")
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    
-    # Grab all mp4 files and sort them to process in chronological order
-    clips = sorted([f for f in os.listdir(clips_dir) if f.endswith(".mp4")])
-    
-    if not clips:
-        print(f"Error: No clips found in {clips_dir}. Run Phase 1 first.")
-        return
+    os.makedirs(META_DIR, exist_ok=True)
+
+    model = WhisperModel(
+        MODEL_SIZE,
+        device=DEVICE,
+        compute_type=COMPUTE_TYPE
+    )
+
+    clips = sorted(f for f in os.listdir(CLIPS_DIR) if f.endswith(".mp4"))
 
     for filename in clips:
-        clip_path = os.path.join(clips_dir, filename)
-        base_name = filename.replace(".mp4", "")
-        meta_path = os.path.join(meta_dir, f"{base_name}_stt.json")
-        
-        # Skip if already processed (saves your life if the script crashes midway)
-        if os.path.exists(meta_path):
-            print(f"Skipping {filename} (already transcribed).")
+        clip_path = os.path.join(CLIPS_DIR, filename)
+        base = filename.replace(".mp4", "")
+        out_path = os.path.join(META_DIR, f"{base}_stt.json")
+
+        if os.path.exists(out_path):
+            print(f"[SKIP] {filename}")
             continue
-            
+
         print(f"Transcribing {filename}...")
-        
-        # Transcribe directly from the mp4
-        segments, info = model.transcribe(clip_path, beam_size=5)
-        
-        # Combine all spoken segments in the 10-second clip
-        transcript = " ".join([segment.text for segment in segments]).strip()
-        
-        # Package and save the metadata
-        metadata_payload = {
-            "clip_filename": filename,
+
+        # -------- HARD AUDIO CHECK --------
+        if not has_audio_stream(clip_path):
+            print(f"[NO AUDIO STREAM] {filename}")
+            payload = {
+                "clip": filename,
+                "transcript": ""
+            }
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            continue
+
+        try:
+            segments, info = model.transcribe(
+                clip_path,
+                beam_size=5,
+                vad_filter=True
+            )
+            transcript = " ".join(seg.text.strip() for seg in segments)
+
+        except Exception as e:
+            print(f"[DECODE ERROR] {filename}: {e}")
+            transcript = ""
+
+        payload = {
+            "clip": filename,
             "transcript": transcript
         }
-        
-        with open(meta_path, "w") as f:
-            json.dump(metadata_payload, f, indent=4)
-            
-        print(f"Saved -> {meta_path}")
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        print(f"Saved -> {out_path}")
+
 
 if __name__ == "__main__":
     transcribe_clips()
